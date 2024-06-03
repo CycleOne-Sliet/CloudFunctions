@@ -19,6 +19,15 @@ app = initialize_app()
 @https_fn.on_call()
 async def get_token(req: https_fn.CallableRequest) -> Any:
     firestore_client: google.cloud.firestore.Client = firestore.client()
+    uid = req.auth.uid
+    if uid is None:
+        raise https_fn.HttpsError(
+            https_fn.FunctionsErrorCode.UNAUTHENTICATED, "Unauthenticated Request")
+
+    if firestore_client.collection("users").document(uid).hasCycle:
+        raise https_fn.HttpsError(
+            https_fn.FunctionsErrorCode.PERMISSION_DENIED, "User already has a cycle")
+
     seecret = os.getenv("SEECRET")
     key = b"aaaaaaaabbbbbbbb"
     if seecret is not None:
@@ -40,14 +49,10 @@ async def get_token(req: https_fn.CallableRequest) -> Any:
     cycleId = parsedToken["cycleId"]
     standTime = parsedToken["time"]
     mac = parsedToken["mac"]
+
     if isUnlocked is None or cycleId is None or standTime is None or mac is None:
         raise https_fn.HttpsError(
             https_fn.FunctionsErrorCode.MISSING_FIELD, "Invalid Token")
-
-    uid = req.auth.uid
-    if uid is None:
-        raise https_fn.HttpsError(
-            https_fn.FunctionsErrorCode.MISSING_FIELD, "Missing field uid")
 
     current_time = time.time_ns()
     cycleRef = firestore_client.collection("cycles").document(cycleId)
