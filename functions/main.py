@@ -1,8 +1,7 @@
 # Welcome to Cloud Functions for Firebase for Python!
 # To get started, simply uncomment the below code or create your own.
 # Deploy with `firebase deploy`
-
-from firebase_functions import https_fn
+from firebase_functions import https_fn, identity_fn
 from firebase_admin import initialize_app, firestore
 import google.cloud.firestore
 from Crypto.Cipher import AES
@@ -17,14 +16,14 @@ app = initialize_app()
 
 
 @https_fn.on_call()
-async def get_token(req: https_fn.CallableRequest) -> Any:
+def get_token(req: https_fn.CallableRequest) -> Any:
     firestore_client: google.cloud.firestore.Client = firestore.client()
     uid = req.auth.uid
     if uid is None:
         raise https_fn.HttpsError(
             https_fn.FunctionsErrorCode.UNAUTHENTICATED, "Unauthenticated Request")
 
-    if firestore_client.collection("users").document(uid).hasCycle:
+    if firestore_client.collection("users").document(uid).get().to_dict()["hasCycle"]:
         raise https_fn.HttpsError(
             https_fn.FunctionsErrorCode.PERMISSION_DENIED, "User already has a cycle")
 
@@ -36,7 +35,8 @@ async def get_token(req: https_fn.CallableRequest) -> Any:
             key = key[:16]
 
     IV = os.urandom(16)
-    token = req.data["token"]
+    tokenB64 = req.data["token"]
+    token = base64.b64decode(tokenB64)
     if token is None:
         raise https_fn.HttpsError(
             https_fn.FunctionsErrorCode.MISSING_FIELD, "Missing field token")
@@ -44,6 +44,8 @@ async def get_token(req: https_fn.CallableRequest) -> Any:
     encryptor = AES.new(key, AES.MODE_CBC, IV=IV)
     decryptor = AES.new(key, AES.MODE_CBC, IV=token[0:16])
     json_string = decryptor.decrypt(token[16:])
+    print(json_string)
+    json_string = json_string.strip(b'\x00')
     parsedToken = json.loads(json_string)
     isUnlocked = parsedToken["isUnlocked"]
     cycleId = parsedToken["cycleId"]
@@ -55,34 +57,40 @@ async def get_token(req: https_fn.CallableRequest) -> Any:
             https_fn.FunctionsErrorCode.MISSING_FIELD, "Invalid Token")
 
     current_time = time.time_ns()
-    cycleRef = firestore_client.collection("cycles").document(cycleId)
-    standRef = firestore_client.collection("stands").document(mac)
-    userRef = firestore_client.collection("users").document(uid)
-    firestore_client.collection("unlockRequests").add(
-        document_id=time, document_data={
-            "cycleId": cycleRef,
-            "madeAtTime": current_time,
-            "tookFrom": standRef,
-            "madeBy": userRef})
-    firestore_client.collection("users").document(uid).update(
-        {"hasCycle": True, "cycleOccupied": cycleRef},
-    )
-    stand = firestore_client.collection("stands").document(mac)
-    stand.cycles.remove(cycleId)
-    stand.update({"cycles": stand.cycles})
-    token = f"{req.auth.uid}:{req.data['cycle_id']}:{current_time};"
+
+    @firestore.transactional
+    def inner_transaction(transaction):
+        cycleRef = firestore_client.collection("cycles").document(str(cycleId))
+        standRef = firestore_client.collection("stands").document(mac)
+        userRef = firestore_client.collection("users").document(uid)
+        stand = firestore_client.collection(
+            "stands").document(mac).get(transaction=transaction).to_dict()
+        stand["cycle"] = None
+        firestore_client.collection("stands").document(mac).set(stand)
+        firestore_client.collection("unlockRequests").add(
+            document_id=str(current_time), document_data={
+                "cycleId": cycleRef,
+                "madeAtTime": current_time,
+                "tookFrom": standRef,
+                "madeBy": userRef})
+        firestore_client.collection("users").document(uid).set(
+            {"hasCycle": True, "cycleOccupied": cycleRef}, merge=True
+        )
+    inner_transaction(transaction = firestore_client.transaction())
+    token = f"{req.auth.uid}:{cycleId}:{current_time};"
     token += '\0' * (16 - len(token) % 16)
     encrypted = encryptor.encrypt(bytes(token, 'utf-8'))
-
-    return {
+    response = {
         "token": str(binascii.hexlify(
             IV +
             encrypted
         )),
     }
+    return response
 
 
-async def update_data(req: https_fn.CallableRequest) -> Any:
+@https_fn.on_call()
+def update_data(req: https_fn.CallableRequest) -> Any:
     firestore_client: google.cloud.firestore.Client = firestore.client()
     seecret = os.getenv("SEECRET")
     key = b"aaaaaaaabbbbbbbb"
@@ -90,7 +98,9 @@ async def update_data(req: https_fn.CallableRequest) -> Any:
         key = base64.b64decode(seecret)
         if len(key) > 16:
             key = key[:16]
-    token = req.data["token"]
+    tokenB64Str = req.data["token"]
+    tokenB64 = tokenB64Str.encode("ascii")
+    token = base64.b64decode(tokenB64)
     if token is None:
         raise https_fn.HttpsError(
             https_fn.FunctionsErrorCode.MISSING_FIELD, "Missing field token")
@@ -102,6 +112,8 @@ async def update_data(req: https_fn.CallableRequest) -> Any:
     IV = token[0:16]
     decryptor = AES.new(key, AES.MODE_CBC, IV=IV)
     json_string = decryptor.decrypt(token[16:])
+    print(json_string)
+    json_string = json_string.strip(b'\x00')
     parsedToken = json.loads(json_string)
     isUnlocked = parsedToken["isUnlocked"]
     cycleId = parsedToken["cycleId"]
@@ -111,13 +123,27 @@ async def update_data(req: https_fn.CallableRequest) -> Any:
         raise https_fn.HttpsError(
             https_fn.FunctionsErrorCode.MISSING_FIELD, "Invalid Token")
     if not isUnlocked:
-        cycleRef = firestore_client.collection("cycles").document(cycleId)
-        docs = (firestore_client.collection("unlockRequests").where(
-            filter=firestore.StructuredQuery.FieldFilter("cycleId", "==", cycleRef)).stream())
-        async for doc in docs:
+        @firestore.transactional
+        def inner_transaction(transaction):
+            cycleRef = firestore_client.collection(
+                "cycles").document(str(cycleId))
+            docs = (firestore_client.collection("unlockRequests").where(
+                filter=firestore.StructuredQuery.FieldFilter("cycleId", "==", cycleRef)).stream(transaction=transaction))
             standRef = firestore_client.collection("stands").document(mac)
-            d = doc.to_dict()
-            d["returnedAt"] = time.time_ns()
-            d["returnedTo"] = standRef
-            firestore_client.collection(
-                "unlockRequests").document(docs.id).update(d)
+            stand = standRef.get(transaction=transaction)
+            stand["cycle"] = cycleRef
+            for doc in docs:
+                d = doc.to_dict()
+                d["returnedAt"] = time.time_ns()
+                d["returnedTo"] = standRef
+                firestore_client.collection(
+                    "unlockRequests").document(doc.id).set(d, merge=True)
+        inner_transaction(transaction = firestore_client.transaction())
+
+
+@identity_fn.before_user_created()
+def on_user_creation(event: identity_fn.AuthBlockingEvent) -> identity_fn.BeforeCreateResponse | None:
+    firestore_client: google.cloud.firestore.Client = firestore.client()
+    firestore_client.collection("users").document(event.data.uid).set(
+        {"hasCycle": False, "cycleOccupied": None})
+    return
