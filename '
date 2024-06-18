@@ -1,0 +1,139 @@
+# Welcome to Cloud Functions for Firebase for Python!
+# To get started, simply uncomment the below code or create your own.
+# Deploy with `firebase deploy`
+from firebase_functions import https_fn, identity_fn
+from firebase_admin import initialize_app, firestore
+import google.cloud.firestore
+from Crypto.Cipher import AES
+import binascii
+import os
+import time
+from typing import Any
+import json
+import base64
+
+app = initialize_app()
+
+
+@https_fn.on_call()
+def get_token(req: https_fn.CallableRequest) -> Any:
+    firestore_client: google.cloud.firestore.Client = firestore.client()
+    uid = req.auth.uid
+    if uid is None:
+        raise https_fn.HttpsError(
+            https_fn.FunctionsErrorCode.UNAUTHENTICATED, "Unauthenticated Request")
+
+    if firestore_client.collection("users").document(uid).get().to_dict()["hasCycle"]:
+        raise https_fn.HttpsError(
+            https_fn.FunctionsErrorCode.PERMISSION_DENIED, "User already has a cycle")
+
+    seecret = os.getenv("SEECRET")
+    key = b"aaaaaaaabbbbbbbb"
+    if seecret is not None:
+        key = base64.b64decode(seecret)
+        if len(key) > 16:
+            key = key[:16]
+
+    IV = os.urandom(16)
+    tokenB64 = req.data["token"]
+    token = base64.b64decode(tokenB64)
+    if token is None:
+        raise https_fn.HttpsError(
+            https_fn.FunctionsErrorCode.MISSING_FIELD, "Missing field token")
+
+    encryptor = AES.new(key, AES.MODE_CBC, IV=IV)
+    decryptor = AES.new(key, AES.MODE_CBC, IV=token[0:16])
+    json_string = decryptor.decrypt(token[16:])
+    print(json_string)
+    json_string = json_string.strip(b'\x00')
+    parsedToken = json.loads(json_string)
+    isUnlocked = parsedToken["isUnlocked"]
+    cycleId = parsedToken["cycleId"]
+    standTime = parsedToken["time"]
+    mac = parsedToken["mac"]
+
+    if isUnlocked is None or cycleId is None or standTime is None or mac is None:
+        raise https_fn.HttpsError(
+            https_fn.FunctionsErrorCode.MISSING_FIELD, "Invalid Token")
+
+    current_time = time.time_ns()
+    cycleRef = firestore_client.collection("cycles").document(str(cycleId))
+    standRef = firestore_client.collection("stands").document(mac)
+    userRef = firestore_client.collection("users").document(uid)
+    firestore_client.collection("unlockRequests").add(
+        document_id=str(current_time), document_data={
+            "cycleId": cycleRef,
+            "madeAtTime": current_time,
+            "tookFrom": standRef,
+            "madeBy": userRef})
+    firestore_client.collection("users").document(uid).set(
+        {"hasCycle": True, "cycleOccupied": cycleRef}, merge=True
+    )
+    stand = firestore_client.collection("stands").document(mac).get().to_dict()
+    stand["cycles"].remove(cycleRef)
+    firestore_client.collection("stands").document(mac).set(stand)
+    token = f"{req.auth.uid}:{req.data['cycle_id']}:{current_time};"
+    token += '\0' * (16 - len(token) % 16)
+    encrypted = encryptor.encrypt(bytes(token, 'utf-8'))
+    response = {
+        "token": str(binascii.hexlify(
+            IV +
+            encrypted
+        )),
+    }
+    return response
+
+
+@https_fn.on_call()
+def update_data(req: https_fn.CallableRequest) -> Any:
+    firestore_client: google.cloud.firestore.Client = firestore.client()
+    seecret = os.getenv("SEECRET")
+    key = b"aaaaaaaabbbbbbbb"
+    if seecret is not None:
+        key = base64.b64decode(seecret)
+        if len(key) > 16:
+            key = key[:16]
+    tokenB64Str = req.data["token"]
+    tokenB64 = tokenB64Str.encode("ascii")
+    token = base64.b64decode(tokenB64)
+    if token is None:
+        raise https_fn.HttpsError(
+            https_fn.FunctionsErrorCode.MISSING_FIELD, "Missing field token")
+    uid = req.auth.uid
+    if uid is None:
+        raise https_fn.HttpsError(
+            https_fn.FunctionsErrorCode.MISSING_FIELD, "Missing field uid")
+
+    IV = token[0:16]
+    decryptor = AES.new(key, AES.MODE_CBC, IV=IV)
+    json_string = decryptor.decrypt(token[16:])
+    print(json_string)
+    json_string = json_string.strip(b'\x00')
+    parsedToken = json.loads(json_string)
+    isUnlocked = parsedToken["isUnlocked"]
+    cycleId = parsedToken["cycleId"]
+    standTime = parsedToken["time"]
+    mac = parsedToken["mac"]
+    if isUnlocked is None or standTime is None or mac is None:
+        raise https_fn.HttpsError(
+            https_fn.FunctionsErrorCode.MISSING_FIELD, "Invalid Token")
+    if not isUnlocked:
+        cycleRef = firestore_client.collection("cycles").document(str(cycleId))
+        docs = (firestore_client.collection("unlockRequests").where(
+            filter=firestore.StructuredQuery.FieldFilter("cycleId", "==", cycleRef)).stream())
+        for doc in docs:
+            standRef = firestore_client.collection("stands").document(mac)
+            d = doc.get().to_dict()
+            d["returnedAt"] = time.time_ns()
+            d["returnedTo"] = standRef
+            firestore_client.collection(
+                "unlockRequests").document(docs.id).set(d, merge=True)
+    return {}
+
+
+@identity_fn.before_user_created()
+def on_user_creation(event: identity_fn.AuthBlockingEvent) -> identity_fn.BeforeCreateResponse | None:
+    firestore_client: google.cloud.firestore.Client = firestore.client()
+    firestore_client.collection("users").document(event.data.uid).set(
+        {"hasCycle": False, "cycleOccupied": None})
+    return
